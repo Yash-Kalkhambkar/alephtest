@@ -1,4 +1,4 @@
-"""Stand allocation logic."""
+"""Greedy stand allocator and independent hard-rule checker."""
 
 from datetime import timedelta
 
@@ -6,179 +6,133 @@ from .models import Allocation, Flight, Stand, UnassignedReason
 
 
 def can_fit(flight: Flight, stand: Stand) -> bool:
-    """Check if an aircraft can physically fit on a stand."""
+    """True if the aircraft fits on the stand (size <=  stand max)."""
     return flight.aircraft_size <= stand.max_size
 
 
 def allocate_stands(
     flights: list[Flight],
     stands: list[Stand],
-    buffer: timedelta
+    buffer: timedelta,
 ) -> list[Allocation]:
     """
-    Allocate stands to flights using a greedy first-come-first-served strategy.
-    
-    Strategy:
-    - Sort flights by (arrival, departure, flight_id)
-    - For each flight, find compatible free stands
-    - Pick the best available stand: PLB first, then smallest sufficient size, then alphabetically
-    - If no stand available, mark unassigned with reason
-    
-    Args:
-        flights: List of valid flights
-        stands: List of valid stands
-        buffer: Turnaround buffer (timedelta)
-        
-    Returns:
-        List of Allocation objects, one per flight
+    Greedy first-come-first-served allocation.
+
+    Sort by (arrival, departure, flight_id) for determinism, then for each
+    flight pick the first free compatible stand ranked by:
+      1. PLB before REMOTE
+      2. Smallest sufficient size (best-fit keeps large stands for large aircraft)
+      3. Stand ID alphabetically (tie-break)
+
+    A flight is never left unassigned while a free compatible stand exists.
     """
-    # Sort flights by arrival time (then departure, then id for determinism)
     sorted_flights = sorted(
         flights,
-        key=lambda f: (f.arrival_time, f.departure_time, f.flight_id)
+        key=lambda f: (f.arrival_time, f.departure_time, f.flight_id),
     )
-    
-    # Track last departure time per stand
-    stand_last_departure = {stand.stand_id: None for stand in stands}
-    
+
+    # last departure recorded per stand so we can check the buffer in O(1)
+    last_departure: dict[str, None] = {s.stand_id: None for s in stands}
+
     allocations = []
-    
+
     for flight in sorted_flights:
-        # Find compatible stands (by size)
-        compatible_stands = [s for s in stands if can_fit(flight, s)]
-        
-        if not compatible_stands:
-            # No stand can ever take this aircraft
+        compatible = [s for s in stands if can_fit(flight, s)]
+
+        if not compatible:
             allocations.append(Allocation(
-                flight=flight,
-                stand=None,
+                flight=flight, stand=None,
                 reason=UnassignedReason.NO_COMPATIBLE_STAND,
-                message=f"No stand can take size {flight.aircraft_size.name}."
+                message=f"No stand can take size {flight.aircraft_size.name}.",
             ))
             continue
-        
-        # Find free stands (respecting buffer)
-        free_stands = []
-        for stand in compatible_stands:
-            last_dep = stand_last_departure[stand.stand_id]
-            if last_dep is None:
-                # Stand never used
-                free_stands.append(stand)
-            elif flight.arrival_time >= last_dep + buffer:
-                # Buffer respected
-                free_stands.append(stand)
-        
-        if not free_stands:
-            # All compatible stands are busy
+
+        free = [
+            s for s in compatible
+            if last_departure[s.stand_id] is None
+            or flight.arrival_time >= last_departure[s.stand_id] + buffer
+        ]
+
+        if not free:
+            buf_min = int(buffer.total_seconds() / 60)
             allocations.append(Allocation(
-                flight=flight,
-                stand=None,
+                flight=flight, stand=None,
                 reason=UnassignedReason.NO_STAND_AVAILABLE,
                 message=(
-                    f"All {len(compatible_stands)} stands that can take size {flight.aircraft_size.name} "
-                    f"are occupied or within the {int(buffer.total_seconds() / 60)}-minute turnaround buffer "
+                    f"All {len(compatible)} stands that can take size {flight.aircraft_size.name} "
+                    f"are occupied or within the {buf_min}-minute turnaround buffer "
                     f"at {flight.arrival_time.strftime('%Y-%m-%dT%H:%M:%SZ')}."
-                )
+                ),
             ))
             continue
-        
-        # Pick best free stand: PLB first, then smallest size, then alphabetically
-        best_stand = min(
-            free_stands,
-            key=lambda s: (
-                0 if s.stand_type.value == "PLB" else 1,
-                s.max_size,
-                s.stand_id
-            )
+
+        best = min(
+            free,
+            key=lambda s: (0 if s.stand_type.value == "PLB" else 1, s.max_size, s.stand_id),
         )
-        
-        # Assign
-        allocations.append(Allocation(
-            flight=flight,
-            stand=best_stand,
-            reason=None,
-            message=None
-        ))
-        
-        # Update stand's last departure
-        stand_last_departure[best_stand.stand_id] = flight.departure_time
-    
+
+        allocations.append(Allocation(flight=flight, stand=best, reason=None, message=None))
+        last_departure[best.stand_id] = flight.departure_time
+
     return allocations
 
 
 def find_violations(
     allocations: list[Allocation],
     stands: list[Stand],
-    buffer: timedelta
+    buffer: timedelta,
 ) -> list[str]:
     """
-    Independent checker: verify no allocation violates the hard rules.
-    
-    Returns a list of violation messages (empty if all rules hold).
-    
-    Checks:
-    - H1: No overlapping flights on a stand
-    - H2: Aircraft size <= stand max_size
-    - H3: Turnaround buffer between consecutive flights
+    Independent checker — re-reads the finished result from scratch and
+    verifies all three hard rules hold. Does not reuse the allocator's
+    shortcut. Returns a list of violation messages (empty = all good).
+
+    H1: no overlapping flights on a stand
+    H2: aircraft size <= stand max_size
+    H3: gap between consecutive flights >= buffer
     """
     violations = []
-    
-    # Build stand lookup
     stand_by_id = {s.stand_id: s for s in stands}
-    
-    # Group allocations by stand
-    by_stand = {}
+
+    # group by stand
+    by_stand: dict[str, list[Allocation]] = {}
     for alloc in allocations:
         if alloc.stand is None:
-            continue  # Unassigned flights don't occupy stands
-        
-        stand_id = alloc.stand.stand_id
-        if stand_id not in by_stand:
-            by_stand[stand_id] = []
-        by_stand[stand_id].append(alloc)
-    
-    # Check each stand's schedule
+            continue
+        by_stand.setdefault(alloc.stand.stand_id, []).append(alloc)
+
     for stand_id, stand_allocs in by_stand.items():
         stand = stand_by_id.get(stand_id)
         if stand is None:
             violations.append(f"Allocation references unknown stand '{stand_id}'")
             continue
-        
-        # Sort by arrival
-        sorted_allocs = sorted(stand_allocs, key=lambda a: a.flight.arrival_time)
-        
-        for alloc in sorted_allocs:
-            flight = alloc.flight
-            
-            # H2: Size fit
-            if not can_fit(flight, stand):
+
+        ordered = sorted(stand_allocs, key=lambda a: a.flight.arrival_time)
+
+        for alloc in ordered:
+            f = alloc.flight
+            if not can_fit(f, stand):  # H2
                 violations.append(
-                    f"Flight {flight.flight_id} (size {flight.aircraft_size.name}) "
+                    f"Flight {f.flight_id} (size {f.aircraft_size.name}) "
                     f"does not fit on stand {stand_id} (max {stand.max_size.name})"
                 )
-        
-        # H1 and H3: Check consecutive flights
-        for i in range(len(sorted_allocs) - 1):
-            curr = sorted_allocs[i]
-            next_alloc = sorted_allocs[i + 1]
-            
-            curr_flight = curr.flight
-            next_flight = next_alloc.flight
-            
-            # H1: No overlap [arrival, departure)
-            if next_flight.arrival_time < curr_flight.departure_time:
+
+        for i in range(len(ordered) - 1):
+            a, b = ordered[i].flight, ordered[i + 1].flight
+
+            if b.arrival_time < a.departure_time:  # H1
                 violations.append(
-                    f"Stand {stand_id}: Flights {curr_flight.flight_id} and {next_flight.flight_id} overlap "
-                    f"({curr_flight.arrival_time.strftime('%H:%M')}–{curr_flight.departure_time.strftime('%H:%M')} "
-                    f"vs {next_flight.arrival_time.strftime('%H:%M')}–{next_flight.departure_time.strftime('%H:%M')})"
+                    f"Stand {stand_id}: {a.flight_id} and {b.flight_id} overlap "
+                    f"({a.arrival_time.strftime('%H:%M')}–{a.departure_time.strftime('%H:%M')} "
+                    f"vs {b.arrival_time.strftime('%H:%M')}–{b.departure_time.strftime('%H:%M')})"
                 )
-            
-            # H3: Buffer
-            gap = next_flight.arrival_time - curr_flight.departure_time
-            if gap < buffer:
+
+            gap = b.arrival_time - a.departure_time
+            if gap < buffer:  # H3
                 violations.append(
-                    f"Stand {stand_id}: Gap between {curr_flight.flight_id} and {next_flight.flight_id} "
-                    f"is {int(gap.total_seconds() / 60)} minutes, less than the {int(buffer.total_seconds() / 60)}-minute buffer"
+                    f"Stand {stand_id}: gap between {a.flight_id} and {b.flight_id} "
+                    f"is {int(gap.total_seconds() / 60)} min, "
+                    f"less than the {int(buffer.total_seconds() / 60)}-min buffer"
                 )
-    
+
     return violations
